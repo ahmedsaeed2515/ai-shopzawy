@@ -1,0 +1,959 @@
+# 🗄️ Cursor Agent — JSON to SQLite + Hybrid RAG System
+# Location: aiShopzawy/
+
+---
+
+## WHO YOU ARE
+
+You are a Senior Data Engineer and AI Systems Architect.
+You work autonomously, think deeply before acting, and never stop mid-task.
+You adapt to what you find in the codebase — not what you assume.
+You document every decision in Arabic so the developer understands everything.
+
+---
+
+## YOUR MISSION
+
+Build a complete Hybrid Intelligence System that combines:
+1. **SQLite database** built from existing JSON files
+2. **Existing Chroma RAG** (don't touch it)
+3. **Smart LLM router** that decides which source to use per question
+4. **Function Calling tools** the LLM uses to get accurate data
+
+The result: a bot that answers ANY question accurately — general or specific.
+
+---
+
+## STEP 0 — INSPECT EVERYTHING FIRST
+
+Before writing a single line of code, do this:
+
+### 0.1 — Find and Read All JSON Files
+
+Search the entire monorepo for JSON files related to products.
+Look in: `aiShopzawy/`, `aiShopzawy/data/`, any `data/` or `exports/` folder.
+
+For each JSON file you find, report:
+```
+File: [path]
+Size: [size]
+Records: [count]
+Structure: [top-level keys]
+Sample record: [paste one record]
+Has price field?: [yes/no — field name]
+Has stock field?: [yes/no — field name]
+Has brand field?: [yes/no — field name]
+Has category field?: [yes/no — field name]
+Has images?: [yes/no — field name]
+Has variants?: [yes/no — structure]
+```
+
+### 0.2 — Find and Read Existing RAG Code
+
+Search for Chroma initialization code.
+Read the search function and understand:
+- Collection name(s)
+- What fields are stored in metadata
+- What the search function returns
+- How it's currently connected to the LLM
+
+Report:
+```
+RAG Location: [file path]
+Collection Name: [name]
+Metadata Fields: [list all]
+Search Function: [signature]
+Returns Images: [yes/no]
+Connected to LLM: [how]
+Current Issues: [what's missing]
+```
+
+### 0.3 — Find Existing LLM Connection
+
+Find where Groq and Qwen are initialized.
+Understand the current prompt structure.
+
+**Write the full inspection report. Then proceed.**
+
+---
+
+## STEP 1 — BUILD THE SQLITE DATABASE
+
+Create file: `aiShopzawy/database/build_sqlite.py`
+
+### 1.1 — Schema Design
+
+Based on what you found in the JSON files, create this SQLite schema.
+**Adapt field names to match the actual JSON structure you found.**
+
+```sql
+-- Core products table
+CREATE TABLE IF NOT EXISTS products (
+    id INTEGER PRIMARY KEY,
+    external_id TEXT,
+    name_ar TEXT NOT NULL,
+    name_en TEXT,
+    slug TEXT,
+    description TEXT,
+    short_description TEXT,
+    category_id INTEGER,
+    category_name TEXT,
+    brand_id INTEGER,
+    brand_name TEXT,
+    base_price REAL DEFAULT 0,
+    sale_price REAL DEFAULT 0,
+    discount_percent REAL DEFAULT 0,
+    in_stock INTEGER DEFAULT 0,
+    stock_quantity INTEGER DEFAULT 0,
+    image_url TEXT,
+    product_url TEXT,
+    is_featured INTEGER DEFAULT 0,
+    is_published INTEGER DEFAULT 1,
+    tags TEXT,
+    created_at TEXT,
+    updated_at TEXT
+);
+
+-- Variants (sizes, colors)
+CREATE TABLE IF NOT EXISTS product_variants (
+    id INTEGER PRIMARY KEY,
+    product_id INTEGER NOT NULL,
+    sku TEXT,
+    color TEXT,
+    size TEXT,
+    price REAL DEFAULT 0,
+    sale_price REAL DEFAULT 0,
+    stock INTEGER DEFAULT 0,
+    FOREIGN KEY (product_id) REFERENCES products(id)
+);
+
+-- Categories
+CREATE TABLE IF NOT EXISTS categories (
+    id INTEGER PRIMARY KEY,
+    external_id TEXT,
+    name_ar TEXT,
+    name_en TEXT,
+    parent_id INTEGER,
+    slug TEXT
+);
+
+-- Brands
+CREATE TABLE IF NOT EXISTS brands (
+    id INTEGER PRIMARY KEY,
+    external_id TEXT,
+    name TEXT NOT NULL,
+    slug TEXT
+);
+
+-- Active offers
+CREATE TABLE IF NOT EXISTS offers (
+    id INTEGER PRIMARY KEY,
+    name TEXT,
+    discount_type TEXT,
+    discount_value REAL,
+    min_order REAL DEFAULT 0,
+    start_date TEXT,
+    end_date TEXT,
+    is_active INTEGER DEFAULT 1
+);
+
+-- Voucher codes
+CREATE TABLE IF NOT EXISTS vouchers (
+    id INTEGER PRIMARY KEY,
+    code TEXT UNIQUE,
+    discount_type TEXT,
+    discount_value REAL,
+    min_order REAL DEFAULT 0,
+    usage_limit INTEGER,
+    used_count INTEGER DEFAULT 0,
+    expires_at TEXT,
+    is_active INTEGER DEFAULT 1
+);
+
+-- Performance indexes
+CREATE INDEX IF NOT EXISTS idx_products_price ON products(sale_price);
+CREATE INDEX IF NOT EXISTS idx_products_brand ON products(brand_name);
+CREATE INDEX IF NOT EXISTS idx_products_category ON products(category_name);
+CREATE INDEX IF NOT EXISTS idx_products_stock ON products(in_stock, stock_quantity);
+CREATE INDEX IF NOT EXISTS idx_products_featured ON products(is_featured);
+```
+
+### 1.2 — JSON to SQLite Converter
+
+```python
+import sqlite3
+import json
+import os
+from pathlib import Path
+
+class JSONToSQLite:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.conn = sqlite3.connect(db_path)
+        self.conn.row_factory = sqlite3.Row
+        self.errors = []
+        self.stats = {}
+
+    def build_from_json(self, json_folder: str):
+        """
+        Main method — reads all JSON files and builds SQLite.
+        Handles any JSON structure found in the folder.
+        """
+        self._create_schema()
+        
+        json_files = list(Path(json_folder).glob("**/*.json"))
+        print(f"Found {len(json_files)} JSON files")
+        
+        for json_file in json_files:
+            print(f"Processing: {json_file.name}")
+            self._process_file(json_file)
+        
+        self._print_report()
+
+    def _process_file(self, file_path: Path):
+        """
+        Reads one JSON file and routes data to correct table.
+        Auto-detects data type from structure.
+        """
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        # Handle both array and single object
+        if isinstance(data, dict):
+            # Could be {products: [...]} or a single product
+            for key in ['products', 'items', 'data', 'results']:
+                if key in data:
+                    data = data[key]
+                    break
+            else:
+                data = [data]
+        
+        if not data:
+            return
+            
+        # Detect type from first record
+        first = data[0] if data else {}
+        data_type = self._detect_type(first, file_path.stem)
+        
+        handler = {
+            'product': self._insert_product,
+            'category': self._insert_category,
+            'brand': self._insert_brand,
+            'offer': self._insert_offer,
+            'voucher': self._insert_voucher,
+        }.get(data_type)
+        
+        if handler:
+            count = 0
+            for record in data:
+                try:
+                    handler(record)
+                    count += 1
+                except Exception as e:
+                    self.errors.append(f"{file_path.name}: {e}")
+            
+            self.stats[data_type] = self.stats.get(data_type, 0) + count
+            self.conn.commit()
+            print(f"  ✅ Inserted {count} {data_type} records")
+        else:
+            print(f"  ⚠️  Unknown data type in {file_path.name} — skipping")
+
+    def _detect_type(self, record: dict, filename: str) -> str:
+        """
+        Smart type detection based on fields and filename.
+        YOU must adapt this based on actual JSON structure found.
+        """
+        filename_lower = filename.lower()
+        
+        if any(x in filename_lower for x in ['product', 'منتج', 'item']):
+            return 'product'
+        if any(x in filename_lower for x in ['category', 'categor', 'فئة', 'cat']):
+            return 'category'
+        if any(x in filename_lower for x in ['brand', 'ماركة', 'براند']):
+            return 'brand'
+        if any(x in filename_lower for x in ['offer', 'عرض', 'discount']):
+            return 'offer'
+        if any(x in filename_lower for x in ['voucher', 'coupon', 'كوبون']):
+            return 'voucher'
+        
+        # Detect from fields if filename didn't help
+        if any(k in record for k in ['price', 'sale_price', 'سعر', 'variants']):
+            return 'product'
+        if any(k in record for k in ['parent_id', 'parent_category']):
+            return 'category'
+        
+        return 'unknown'
+
+    def _insert_product(self, record: dict):
+        """
+        Insert one product. Map JSON fields to DB columns.
+        YOU must adapt field names to match actual JSON.
+        """
+        # Extract nested price from variants if not at top level
+        base_price = (
+            record.get('price') or
+            record.get('base_price') or
+            record.get('original_price') or
+            self._get_min_variant_price(record) or 0
+        )
+        
+        sale_price = (
+            record.get('sale_price') or
+            record.get('discounted_price') or
+            base_price
+        )
+        
+        discount = 0
+        if base_price > 0 and sale_price < base_price:
+            discount = round((base_price - sale_price) / base_price * 100, 1)
+        
+        # Get stock
+        stock_qty = (
+            record.get('stock') or
+            record.get('stock_quantity') or
+            record.get('quantity') or
+            self._get_total_variant_stock(record) or 0
+        )
+        
+        in_stock = 1 if stock_qty > 0 else 0
+        
+        # Handle tags as comma-separated string
+        tags = record.get('tags', [])
+        if isinstance(tags, list):
+            tags = ','.join(str(t) for t in tags)
+        
+        # Get image
+        image = (
+            record.get('image_url') or
+            record.get('image') or
+            record.get('thumbnail') or
+            self._get_primary_image(record) or ''
+        )
+        
+        # Get category and brand (handle nested objects)
+        category_name = self._extract_name(record.get('category') or record.get('category_name', ''))
+        brand_name = self._extract_name(record.get('brand') or record.get('brand_name', ''))
+        
+        product_id = self.conn.execute("""
+            INSERT OR REPLACE INTO products (
+                external_id, name_ar, name_en, slug, description, short_description,
+                category_name, brand_name, base_price, sale_price, discount_percent,
+                in_stock, stock_quantity, image_url, is_featured, is_published, tags
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            str(record.get('id', '')),
+            record.get('name') or record.get('name_ar') or record.get('title', ''),
+            record.get('name_en') or record.get('name_english', ''),
+            record.get('slug', ''),
+            record.get('description', ''),
+            record.get('short_description', ''),
+            category_name,
+            brand_name,
+            float(base_price),
+            float(sale_price),
+            float(discount),
+            in_stock,
+            int(stock_qty),
+            image,
+            int(bool(record.get('is_featured', False))),
+            int(bool(record.get('is_published', True))),
+            tags
+        )).lastrowid
+        
+        # Insert variants
+        variants = record.get('variants', record.get('product_variants', []))
+        for v in variants:
+            self._insert_variant(product_id, v)
+
+    def _insert_variant(self, product_id: int, variant: dict):
+        self.conn.execute("""
+            INSERT OR REPLACE INTO product_variants
+            (product_id, sku, color, size, price, sale_price, stock)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            product_id,
+            variant.get('sku', ''),
+            variant.get('color', ''),
+            variant.get('size', ''),
+            float(variant.get('price', 0)),
+            float(variant.get('sale_price', variant.get('price', 0))),
+            int(variant.get('stock', variant.get('quantity', 0)))
+        ))
+
+    def _get_min_variant_price(self, record: dict) -> float:
+        variants = record.get('variants', [])
+        if not variants:
+            return 0
+        prices = [v.get('sale_price') or v.get('price', 0) for v in variants]
+        return min(p for p in prices if p > 0) if prices else 0
+
+    def _get_total_variant_stock(self, record: dict) -> int:
+        variants = record.get('variants', [])
+        return sum(int(v.get('stock', v.get('quantity', 0))) for v in variants)
+
+    def _get_primary_image(self, record: dict) -> str:
+        images = record.get('images', record.get('product_images', []))
+        if not images:
+            return ''
+        if isinstance(images[0], str):
+            return images[0]
+        return images[0].get('url', images[0].get('image_url', ''))
+
+    def _extract_name(self, value) -> str:
+        if isinstance(value, dict):
+            return value.get('name') or value.get('name_ar') or value.get('title', '')
+        return str(value) if value else ''
+
+    def _print_report(self):
+        print("\n" + "="*50)
+        print("  SQLite Build Complete")
+        print("="*50)
+        for table, count in self.stats.items():
+            print(f"  ✅ {table}: {count} records")
+        if self.errors:
+            print(f"\n  ⚠️  Errors ({len(self.errors)}):")
+            for e in self.errors[:5]:
+                print(f"     - {e}")
+        
+        # Verify
+        tables = ['products', 'product_variants', 'categories', 'brands']
+        print("\n  Database Verification:")
+        for table in tables:
+            count = self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            print(f"  📊 {table}: {count} rows")
+        print("="*50)
+        print(f"\n  Database saved to: {self.db_path}")
+
+if __name__ == "__main__":
+    builder = JSONToSQLite("aiShopzawy/database/shopzawy.db")
+    builder.build_from_json("aiShopzawy/data/")
+    print("\nDone! Test with:")
+    print("  python -c \"import sqlite3; db=sqlite3.connect('aiShopzawy/database/shopzawy.db'); print(db.execute('SELECT COUNT(*) FROM products').fetchone())\"")
+```
+
+---
+
+## STEP 2 — BUILD THE SQL TOOLS
+
+Create file: `aiShopzawy/tools/sql_tools.py`
+
+Build these 6 tools the LLM can call:
+
+```python
+import sqlite3
+from typing import Optional
+
+DB_PATH = "aiShopzawy/database/shopzawy.db"
+
+def get_cheapest_products(
+    category: Optional[str] = None,
+    brand: Optional[str] = None,
+    max_price: Optional[float] = None,
+    limit: int = 5
+) -> list[dict]:
+    """
+    Returns cheapest available products.
+    USE WHEN: customer asks for cheapest, lowest price, budget options.
+    """
+    query = """
+        SELECT name_ar, brand_name, category_name,
+               sale_price, base_price, discount_percent,
+               stock_quantity, image_url, slug
+        FROM products
+        WHERE in_stock = 1 AND is_published = 1
+    """
+    params = []
+    
+    if category:
+        query += " AND category_name LIKE ?"
+        params.append(f"%{category}%")
+    if brand:
+        query += " AND brand_name LIKE ?"
+        params.append(f"%{brand}%")
+    if max_price:
+        query += " AND sale_price <= ?"
+        params.append(max_price)
+    
+    query += " ORDER BY sale_price ASC LIMIT ?"
+    params.append(limit)
+    
+    return _execute(query, params)
+
+
+def get_most_expensive_products(
+    category: Optional[str] = None,
+    brand: Optional[str] = None,
+    limit: int = 5
+) -> list[dict]:
+    """
+    Returns most expensive / premium products.
+    USE WHEN: customer asks for best, premium, highest quality.
+    """
+    query = """
+        SELECT name_ar, brand_name, category_name,
+               sale_price, base_price, discount_percent,
+               stock_quantity, image_url, slug
+        FROM products
+        WHERE in_stock = 1 AND is_published = 1
+    """
+    params = []
+    if category:
+        query += " AND category_name LIKE ?"
+        params.append(f"%{category}%")
+    if brand:
+        query += " AND brand_name LIKE ?"
+        params.append(f"%{brand}%")
+    
+    query += " ORDER BY sale_price DESC LIMIT ?"
+    params.append(limit)
+    
+    return _execute(query, params)
+
+
+def filter_products_by_price(
+    min_price: float,
+    max_price: float,
+    category: Optional[str] = None,
+    brand: Optional[str] = None,
+    limit: int = 10
+) -> list[dict]:
+    """
+    Returns products within price range.
+    USE WHEN: customer says 'between X and Y' or 'under X' or 'above X'.
+    """
+    query = """
+        SELECT name_ar, brand_name, category_name,
+               sale_price, base_price, discount_percent,
+               stock_quantity, image_url, slug
+        FROM products
+        WHERE in_stock = 1 AND is_published = 1
+          AND sale_price BETWEEN ? AND ?
+    """
+    params = [min_price, max_price]
+    
+    if category:
+        query += " AND category_name LIKE ?"
+        params.append(f"%{category}%")
+    if brand:
+        query += " AND brand_name LIKE ?"
+        params.append(f"%{brand}%")
+    
+    query += " ORDER BY sale_price ASC LIMIT ?"
+    params.append(limit)
+    
+    return _execute(query, params)
+
+
+def compare_products(product_names: list[str]) -> list[dict]:
+    """
+    Returns detailed data for specific products to compare.
+    USE WHEN: customer wants to compare two or more specific products.
+    """
+    if not product_names:
+        return []
+    
+    placeholders = ','.join(['?' for _ in product_names])
+    query = f"""
+        SELECT p.name_ar, p.brand_name, p.category_name,
+               p.sale_price, p.base_price, p.discount_percent,
+               p.stock_quantity, p.description, p.image_url,
+               GROUP_CONCAT(pv.color || '/' || pv.size, ', ') as variants
+        FROM products p
+        LEFT JOIN product_variants pv ON pv.product_id = p.id
+        WHERE p.name_ar LIKE '%{product_names[0]}%'
+           OR p.name_ar LIKE '%{product_names[-1]}%'
+        GROUP BY p.id
+        LIMIT 10
+    """
+    return _execute(query, [])
+
+
+def get_best_deals(limit: int = 10) -> list[dict]:
+    """
+    Returns products with highest discount percentage.
+    USE WHEN: customer asks about offers, discounts, deals, sales.
+    """
+    query = """
+        SELECT name_ar, brand_name, category_name,
+               sale_price, base_price, discount_percent,
+               stock_quantity, image_url, slug
+        FROM products
+        WHERE in_stock = 1 AND is_published = 1
+          AND discount_percent > 0
+        ORDER BY discount_percent DESC
+        LIMIT ?
+    """
+    return _execute(query, [limit])
+
+
+def check_product_availability(product_name: str) -> dict:
+    """
+    Checks if a specific product is available and its current price.
+    USE WHEN: customer asks 'do you have X?' or 'is X available?'
+    """
+    query = """
+        SELECT name_ar, brand_name, sale_price,
+               in_stock, stock_quantity, image_url,
+               (SELECT GROUP_CONCAT(color || ' ' || size || ' (' || stock || ')', ' | ')
+                FROM product_variants WHERE product_id = products.id) as variants
+        FROM products
+        WHERE name_ar LIKE ? OR name_en LIKE ? OR slug LIKE ?
+        LIMIT 3
+    """
+    search = f"%{product_name}%"
+    results = _execute(query, [search, search, search])
+    return results[0] if results else {"found": False, "message": f"مش لاقيش '{product_name}'"}
+
+
+def _execute(query: str, params: list) -> list[dict]:
+    """Execute query and return list of dicts."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only = ON")  # Extra safety
+        rows = conn.execute(query, params).fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+    except Exception as e:
+        return [{"error": str(e)}]
+```
+
+---
+
+## STEP 3 — BUILD THE FUNCTION CALLING DEFINITIONS
+
+Create file: `aiShopzawy/tools/tool_definitions.py`
+
+```python
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_cheapest_products",
+            "description": "يجيب المنتجات الأرخص سعراً. استخدمه لما العميل يسأل عن أرخص حاجة أو ميزانية محدودة أو أقل سعر.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string", "description": "اسم الفئة مثل: موبايل، شنطة، لاب توب"},
+                    "brand": {"type": "string", "description": "اسم البراند مثل: سامسونج، آبل"},
+                    "max_price": {"type": "number", "description": "الحد الأقصى للسعر بالجنيه"},
+                    "limit": {"type": "integer", "description": "عدد النتائج (default: 5)"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_most_expensive_products",
+            "description": "يجيب المنتجات الأغلى أو الأفخم. استخدمه لما العميل يسأل عن أحسن حاجة أو أغلى أو premium.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string"},
+                    "brand": {"type": "string"},
+                    "limit": {"type": "integer"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "filter_products_by_price",
+            "description": "يفلتر المنتجات في نطاق سعري. استخدمه لما العميل يقول: تحت X جنيه، بين X وY، فوق X جنيه.",
+            "parameters": {
+                "type": "object",
+                "required": ["min_price", "max_price"],
+                "properties": {
+                    "min_price": {"type": "number"},
+                    "max_price": {"type": "number"},
+                    "category": {"type": "string"},
+                    "brand": {"type": "string"},
+                    "limit": {"type": "integer"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "compare_products",
+            "description": "يقارن بين منتجين أو أكتر. استخدمه لما العميل يسأل عن الفرق بين منتجين أو أيهم أحسن.",
+            "parameters": {
+                "type": "object",
+                "required": ["product_names"],
+                "properties": {
+                    "product_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "قائمة أسماء المنتجات للمقارنة"
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_best_deals",
+            "description": "يجيب أفضل العروض والخصومات. استخدمه لما العميل يسأل عن عروض أو خصومات أو تخفيضات.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "عدد العروض (default: 10)"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_rag",
+            "description": "يبحث في كتالوج المنتجات بالمعنى والوصف. استخدمه للأسئلة العامة واقتراح المنتجات والبحث بالخصائص.",
+            "parameters": {
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": {"type": "string", "description": "نص البحث بالعربي أو الإنجليزي"}
+                }
+            }
+        }
+    }
+]
+```
+
+---
+
+## STEP 4 — BUILD THE SMART AGENT
+
+Create file: `aiShopzawy/agent/smart_agent.py`
+
+```python
+import json
+from groq import Groq
+from tools.sql_tools import (
+    get_cheapest_products, get_most_expensive_products,
+    filter_products_by_price, compare_products,
+    get_best_deals, check_product_availability
+)
+from tools.tool_definitions import TOOLS
+
+# Import existing RAG search — adapt path to actual location
+import sys
+sys.path.insert(0, '..')
+
+SYSTEM_PROMPT = """
+أنت "شوبي" — مساعد مبيعات ذكي لمتجر Shopzawy.
+
+## قدراتك
+لديك أدوات قوية للبحث في قاعدة البيانات مباشرة:
+- تقدر تجيب أرخص أو أغلى منتج بدقة 100%
+- تقدر تفلتر بالسعر والبراند والفئة
+- تقدر تقارن بين منتجات بالأرقام الحقيقية
+- تقدر تعرف العروض والخصومات الحالية
+
+## قواعد صارمة
+1. استخدم الأدوات دايماً لأسئلة الأسعار والمخزون — لا تخمّن أبداً
+2. الأسعار اللي بتقولها لازم تيجي من الأداة مش من ذاكرتك
+3. لو منتج مش متوفر — قول كده بوضوح واقترح بديل
+4. ردود قصيرة وواضحة — مش أكتر من 150 كلمة
+5. رد بنفس لغة العميل (عربي أو إنجليزي)
+6. في آخر كل رد، اقترح على العميل يضيف للسلة
+
+## متى تستخدم كل أداة
+- get_cheapest_products: "ارخص، أقل سعر، مناسب لميزانية"
+- get_most_expensive_products: "أغلى، أحسن، premium, فاخر"
+- filter_products_by_price: "تحت X، بين X وY، فوق X"
+- compare_products: "قارن، الفرق، أيهم أحسن"
+- get_best_deals: "عروض، خصومات، تخفيض"
+- search_rag: كل الأسئلة العامة والاقتراحات
+"""
+
+class SmartAgent:
+    def __init__(self, groq_api_key: str, rag_search_fn):
+        self.client = Groq(api_key=groq_api_key)
+        self.rag_search = rag_search_fn
+        self.history = []
+
+    def chat(self, user_message: str) -> str:
+        self.history.append({"role": "user", "content": user_message})
+        
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            *self.history[-8:]  # Last 4 exchanges
+        ]
+        
+        # First LLM call — may invoke tools
+        response = self.client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=messages,
+            tools=TOOLS,
+            tool_choice="auto",
+            temperature=0.3,  # Low for accuracy
+            max_tokens=1000
+        )
+        
+        message = response.choices[0].message
+        
+        # Handle tool calls
+        if message.tool_calls:
+            messages.append(message)
+            
+            for tool_call in message.tool_calls:
+                result = self._execute_tool(
+                    tool_call.function.name,
+                    json.loads(tool_call.function.arguments)
+                )
+                
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": json.dumps(result, ensure_ascii=False)
+                })
+            
+            # Second LLM call — formulate final response with tool results
+            final_response = self.client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=messages,
+                temperature=0.5,
+                max_tokens=500
+            )
+            
+            reply = final_response.choices[0].message.content
+        else:
+            reply = message.content
+        
+        self.history.append({"role": "assistant", "content": reply})
+        return reply
+
+    def _execute_tool(self, tool_name: str, args: dict) -> dict:
+        """Execute the requested tool and return results."""
+        tool_map = {
+            "get_cheapest_products": get_cheapest_products,
+            "get_most_expensive_products": get_most_expensive_products,
+            "filter_products_by_price": filter_products_by_price,
+            "compare_products": compare_products,
+            "get_best_deals": get_best_deals,
+            "check_product_availability": check_product_availability,
+            "search_rag": self.rag_search,
+        }
+        
+        func = tool_map.get(tool_name)
+        if not func:
+            return {"error": f"Tool {tool_name} not found"}
+        
+        try:
+            result = func(**args)
+            return {"success": True, "data": result, "count": len(result) if isinstance(result, list) else 1}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+```
+
+---
+
+## STEP 5 — TEST EVERYTHING
+
+Create file: `aiShopzawy/test_agent.py`
+
+```python
+"""
+Run this to test the complete system.
+Tests both SQL tools and RAG integration.
+"""
+import os
+from dotenv import load_dotenv
+from agent.smart_agent import SmartAgent
+
+load_dotenv()
+
+# Import existing RAG search function
+# Adapt this import based on actual RAG location
+from rag.search import search as rag_search
+
+agent = SmartAgent(
+    groq_api_key=os.getenv("GROQ_API_KEY"),
+    rag_search_fn=rag_search
+)
+
+TEST_QUESTIONS = [
+    # SQL questions
+    "ارخص موبايل سامسونج عندكم؟",
+    "عندكم موبايلات تحت 3000 جنيه؟",
+    "إيه أغلى منتج عندكم في الشنط؟",
+    "إيه أحسن العروض دلوقتي؟",
+    
+    # RAG questions
+    "عندكم شنطة مناسبة للشغل؟",
+    "اقترحلي هدية لبنت عمرها 20 سنة",
+    
+    # Hybrid
+    "عايز شنطة جلد تحت 500 جنيه",
+    "قارن بين سامسونج وآبل عندكم",
+]
+
+print("="*60)
+print("  Shopzawy Smart Agent Test")
+print("="*60)
+
+for question in TEST_QUESTIONS:
+    print(f"\n❓ {question}")
+    print("-" * 40)
+    response = agent.chat(question)
+    print(f"🤖 {response}")
+    print()
+```
+
+---
+
+## STEP 6 — CREATE README
+
+Create `aiShopzawy/database/README.md` with full Arabic explanation:
+
+```markdown
+# قاعدة البيانات المحلية — SQLite
+
+## إيه دي؟
+نسخة محلية من بيانات المنتجات محولة من JSON لـ SQLite.
+معزولة تماماً عن الـ production database.
+
+## إزاي اتبنت؟
+1. قرأنا ملفات JSON من مجلد data/
+2. حولناها لـ SQLite بالجداول دي:
+   - products: المنتجات مع الأسعار والمخزون
+   - product_variants: المقاسات والألوان
+   - categories: الفئات
+   - brands: البراندات
+   - offers: العروض
+   - vouchers: الكوبونات
+
+## إزاي تحدثها؟
+لو الأسعار اتغيرت، شغّل:
+```bash
+python build_sqlite.py
+```
+
+## الفرق عن الـ RAG
+- RAG: بيفهم المعنى والوصف
+- SQLite: بيجيب أرقام دقيقة (أرخص، أغلى، مقارنات)
+```
+
+---
+
+## EXECUTION ORDER — NO STOPPING
+
+1. Run Step 0 — inspect all JSON files and RAG code, write report
+2. Run Step 1 — build SQLite from JSON, verify record counts
+3. Run Step 2 — build SQL tools, test each one manually
+4. Run Step 3 — create tool definitions
+5. Run Step 4 — build smart agent connecting everything
+6. Run Step 5 — run all test questions and show results
+7. Run Step 6 — write documentation
+
+**If JSON structure is different from what's in this prompt — adapt the code.**
+**If RAG import path is different — find it and fix it.**
+**Never stop. Never ask. Just build, adapt, and document.**
+
+The only exception: missing API keys in .env — list them and wait.
+
+Start now with Step 0.
